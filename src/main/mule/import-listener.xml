@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- =====================================================================
+         FLOW B - File Listener. Watches the source folder for new chunk files
+         and imports each one into target Marketo via the Bulk Import API.
+         Each chunk is processed INDEPENDENTLY:
+           - success              -> file moved to processed/, status logged
+           - data failures        -> failed rows appended to error.csv
+           - connectivity failure -> retried; if still failing, file moved to
+                                     reprocess/ and logged in reprocess.csv
+         ===================================================================== -->
+    <flow name="import-chunk-listener" maxConcurrency="2">
+        <file:listener config-ref="File_Config" directory="${dir.source}" autoDelete="false"
+                       outputMimeType="application/octet-stream" doc:name="On new chunk file">
+            <scheduling-strategy>
+                <fixed-frequency frequency="5000"/>
+            </scheduling-strategy>
+            <file:matcher filenamePattern="chunk-*.csv"/>
+        </file:listener>
+
+        <!-- capture the file up front; payload/attributes change after HTTP calls.
+             Force the content into memory (as String) so the original file can be
+             safely moved out of the source folder before the long import runs. -->
+        <set-variable variableName="chunkName"    value="#[attributes.fileName]" doc:name="chunkName"/>
+        <set-variable variableName="chunkContent" value="#[payload as String]" doc:name="chunkContent"/>
+        <logger level="INFO" message="#['IMPORT START | chunk=' ++ vars.chunkName]" doc:name="Log chunk start"/>
+
+        <!-- Move the chunk OUT of the watched folder immediately so the listener's
+             next poll cannot pick it up again while this batch is still importing. -->
+        <file:move config-ref="File_Config" sourcePath="#[attributes.path]"
+                   targetPath="#[p('dir.inprogress') ++ '/' ++ vars.chunkName]" overwrite="true" doc:name="Move to inprogress"/>
+        <set-variable variableName="chunkPath" value="#[p('dir.inprogress') ++ '/' ++ vars.chunkName]" doc:name="chunkPath (inprogress)"/>
+
+        <try doc:name="Process chunk independently">
+            <flow-ref name="get-target-token" doc:name="Target token"/>
+
+            <!-- 1. Bulk Import upload (retried on transient connectivity errors) -->
+            <until-successful maxRetries="${retry.connect.maxRetries}" millisBetweenRetries="${retry.connect.delayMs}" doc:name="Upload (retry on connectivity)">
+                <!-- build the multipart/form-data body in a proper transform, then POST it -->
+                <ee:transform doc:name="Build multipart body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output multipart/form-data
+---
+{
+    parts: {
+        file: {
+            headers: {
+                "Content-Disposition": { name: "file", filename: vars.chunkName },
+                "Content-Type": "text/csv"
+            },
+            content: vars.chunkContent
+        }
+    }
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <http:request method="POST" config-ref="Target_Marketo" path="/bulk/v1/leads.json" doc:name="Bulk import upload">
+                    <http:body>#[payload]</http:body>
+                    <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.targetToken }]]]></http:headers>
+                    <http:query-params><![CDATA[#[{
+                        format: "csv",
+                        lookupField: p('target.marketo.lookupField'),
+                        listId: p('target.marketo.listId')
+                    }]]]></http:query-params>
+                </http:request>
+            </until-successful>
+
+            <!-- call-level rejection (bad request / mapping) counts as a DATA error -->
+            <choice doc:name="Import accepted?">
+                <when expression="#[payload.success == false]">
+                    <raise-error type="APP:IMPORT_REJECTED" description="#['Marketo rejected import: ' ++ write(payload.errors default [], 'application/json')]"/>
+                </when>
+            </choice>
+            <set-variable variableName="batchId" value="#[payload.result[0].batchId]" doc:name="batchId"/>
+
+            <!-- 2. Poll the batch until Complete or Failed -->
+            <until-successful maxRetries="${retry.poll.maxRetries}" millisBetweenRetries="${retry.poll.delayMs}" doc:name="Poll batch status">
+                <http:request method="GET" config-ref="Target_Marketo" path="#['/bulk/v1/leads/batch/' ++ vars.batchId ++ '.json']" doc:name="Get batch status">
+                    <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.targetToken }]]]></http:headers>
+                </http:request>
+                <choice doc:name="Terminal state?">
+                    <when expression="#[not ((payload.result[0].status default '') matches /Complete|Failed/)]">
+                        <raise-error type="APP:BATCH_NOT_READY" description="#['batch status=' ++ (payload.result[0].status default 'unknown')]"/>
+                    </when>
+                </choice>
+            </until-successful>
+            <set-variable variableName="batchStatus" value="#[payload.result[0].status]" doc:name="batchStatus"/>
+            <set-variable variableName="numFailed"   value="#[payload.result[0].numOfRowsFailed default 0]" doc:name="numFailed"/>
+
+            <!-- 3. If any rows failed, pull the failures file and append to error.csv -->
+            <choice doc:name="Any row failures?">
+                <when expression="#[(vars.numFailed as Number default 0) > 0]">
+                    <http:request method="GET" config-ref="Target_Marketo" path="#['/bulk/v1/leads/batch/' ++ vars.batchId ++ '/failures.json']" doc:name="Get failures">
+                        <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.targetToken }]]]></http:headers>
+                    </http:request>
+                    <ee:transform doc:name="Failure rows -> error.csv shape">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/csv header=false
+---
+read((payload default "") as String, "application/csv", {"header": true})
+    map ((r) -> r ++ { failureReason: "IMPORT_DATA_FAILURE", sourceChunk: vars.chunkName })]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                    <file:write config-ref="File_Config" path="#[p('dir.error') ++ '/error.csv']" mode="APPEND" doc:name="Append to error.csv">
+                        <file:content>#[payload]</file:content>
+                    </file:write>
+                </when>
+            </choice>
+
+            <!-- 4. Archive the processed chunk + write a status row -->
+            <file:move config-ref="File_Config" sourcePath="#[vars.chunkPath]"
+                       targetPath="#[p('dir.processed') ++ '/' ++ vars.chunkName]" overwrite="true" doc:name="Move to processed"/>
+            <flow-ref name="write-status" doc:name="Track status"/>
+            <logger level="INFO" message="#['IMPORT DONE | chunk=' ++ vars.chunkName ++ ' | batchId=' ++ (vars.batchId as String) ++ ' | status=' ++ vars.batchStatus ++ ' | failedRows=' ++ (vars.numFailed as String)]" doc:name="Log done"/>
+
+            <error-handler>
+                <!-- CONNECTIVITY class: retries exhausted -> reprocess later -->
+                <on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT, HTTP:SERVICE_UNAVAILABLE, HTTP:INTERNAL_SERVER_ERROR, MULE:RETRY_EXHAUSTED, MULE:CONNECTIVITY"
+                                   doc:name="Connectivity -> reprocess">
+                    <logger level="WARN" message="#['CONNECTIVITY error, sending chunk to reprocess | chunk=' ++ vars.chunkName ++ ' | ' ++ (error.description default '')]"/>
+                    <set-variable variableName="batchStatus" value="REPROCESS" doc:name="status=REPROCESS"/>
+                    <!-- log the reason in reprocess.csv -->
+                    <ee:transform doc:name="reprocess row">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/csv header=false
+---
+[ { chunk: vars.chunkName, reason: "CONNECTIVITY: " ++ (error.description default ""), ts: now() } ]]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                    <file:write config-ref="File_Config" path="#[p('dir.reprocess') ++ '/reprocess.csv']" mode="APPEND" doc:name="Append reprocess.csv">
+                        <file:content>#[payload]</file:content>
+                    </file:write>
+                    <!-- move the chunk file itself to reprocess/ so it can be re-dropped into source later -->
+                    <file:move config-ref="File_Config" sourcePath="#[vars.chunkPath]"
+                               targetPath="#[p('dir.reprocess') ++ '/' ++ vars.chunkName]" overwrite="true" doc:name="Move to reprocess"/>
+                    <flow-ref name="write-status" doc:name="Track status"/>
+                </on-error-continue>
+
+                <!-- everything else = DATA error: whole chunk rejected -> error.csv -->
+                <on-error-continue type="ANY" doc:name="Data error -> error.csv">
+                    <logger level="WARN" message="#['DATA error, sending chunk rows to error.csv | chunk=' ++ vars.chunkName ++ ' | ' ++ (error.description default '')]"/>
+                    <set-variable variableName="batchStatus" value="DATA_FAILED" doc:name="status=DATA_FAILED"/>
+                    <ee:transform doc:name="chunk rows -> error.csv">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/csv header=false
+---
+read((vars.chunkContent default "") as String, "application/csv", {"header": true})
+    map ((r) -> r ++ { failureReason: "IMPORT_REJECTED", sourceChunk: vars.chunkName })]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                    <file:write config-ref="File_Config" path="#[p('dir.error') ++ '/error.csv']" mode="APPEND" doc:name="Append error.csv">
+                        <file:content>#[payload]</file:content>
+                    </file:write>
+                    <file:move config-ref="File_Config" sourcePath="#[vars.chunkPath]"
+                               targetPath="#[p('dir.processed') ++ '/' ++ vars.chunkName]" overwrite="true" doc:name="Move to processed"/>
+                    <flow-ref name="write-status" doc:name="Track status"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- Append one tracking row to status/status.csv -->
+    <sub-flow name="write-status">
+        <ee:transform doc:name="status row">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/csv header=false
+---
+[ {
+    chunk:      vars.chunkName,
+    batchId:    vars.batchId default "-",
+    status:     vars.batchStatus default "-",
+    failedRows: vars.numFailed default "-",
+    timestamp:  now()
+} ]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <file:write config-ref="File_Config" path="#[p('dir.status') ++ '/status.csv']" mode="APPEND" doc:name="Append status.csv">
+            <file:content>#[payload]</file:content>
+        </file:write>
+    </sub-flow>
+
+</mule>

@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- =====================================================================
+         FLOW A - Extract from source Marketo, dedupe, write rejects to
+         error.csv, and split valid leads into 10-record chunk files.
+           Trigger: POST http://localhost:8081/migrate
+         ===================================================================== -->
+    <flow name="extract-dedupe-chunk">
+        <http:listener config-ref="HTTP_Listener" path="/migrate" doc:name="POST /migrate">
+            <http:response statusCode="200"/>
+        </http:listener>
+        <set-variable variableName="runId" value="#[now() as String {format: 'yyyyMMdd-HHmmss'}]" doc:name="runId"/>
+        <logger level="INFO" message="#['EXTRACT START | runId=' ++ vars.runId]" doc:name="Log start"/>
+
+        <!-- 1. Bulk Export: create, enqueue, poll, download -->
+        <flow-ref name="get-source-token" doc:name="Source token"/>
+
+        <http:request method="POST" config-ref="Source_Marketo" path="/bulk/v1/leads/export/create.json" doc:name="Create export job">
+            <http:body><![CDATA[#[output application/json ---
+            {
+                fields: read(p('source.marketo.fields'), "application/json"),
+                filter: { smartListId: p('source.marketo.smartListId') as Number },
+                format: "CSV"
+            }]]]></http:body>
+            <http:headers><![CDATA[#[{
+                "Authorization": "Bearer " ++ vars.sourceToken,
+                "Content-Type": "application/json"
+            }]]]></http:headers>
+        </http:request>
+        <set-variable variableName="exportId" value="#[payload.result[0].exportId]" doc:name="exportId"/>
+
+        <http:request method="POST" config-ref="Source_Marketo" path="#['/bulk/v1/leads/export/' ++ vars.exportId ++ '/enqueue.json']" doc:name="Enqueue export">
+            <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.sourceToken, "Content-Type": "application/json" }]]]></http:headers>
+        </http:request>
+
+        <until-successful maxRetries="${retry.poll.maxRetries}" millisBetweenRetries="${retry.poll.delayMs}" doc:name="Poll until Completed">
+            <http:request method="GET" config-ref="Source_Marketo" path="#['/bulk/v1/leads/export/' ++ vars.exportId ++ '/status.json']" doc:name="Get export status">
+                <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.sourceToken }]]]></http:headers>
+            </http:request>
+            <choice doc:name="Completed?">
+                <when expression="#[payload.result[0].status == 'Failed']">
+                    <raise-error type="APP:EXPORT_FAILED" description="Marketo export job failed."/>
+                </when>
+                <when expression="#[payload.result[0].status != 'Completed']">
+                    <raise-error type="APP:EXPORT_NOT_READY" description="#['status=' ++ (payload.result[0].status default 'unknown')]"/>
+                </when>
+            </choice>
+        </until-successful>
+
+        <http:request method="GET" config-ref="Source_Marketo" path="#['/bulk/v1/leads/export/' ++ vars.exportId ++ '/file.json']" doc:name="Download export file">
+            <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.sourceToken }]]]></http:headers>
+        </http:request>
+        <!-- archive the raw export (auto-creates the extract folder) -->
+        <file:write config-ref="File_Config" path="#[p('dir.extract') ++ '/export-' ++ vars.runId ++ '.csv']" mode="OVERWRITE" doc:name="Archive raw export">
+            <file:content>#[payload]</file:content>
+        </file:write>
+
+        <!-- 2. Parse + dedupe -->
+        <ee:transform doc:name="Parse export CSV">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+read((payload default "") as String, "application/csv", {"header": true})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="totalExtracted" value="#[sizeOf(payload)]" doc:name="totalExtracted"/>
+
+        <ee:transform doc:name="Dedupe (split valid / errors)">
+            <ee:message><ee:set-payload resource="dwl/dedupe.dwl"/></ee:message>
+        </ee:transform>
+        <set-variable variableName="valid"  value="#[payload.valid]"  doc:name="valid"/>
+        <set-variable variableName="errors" value="#[payload.errors]" doc:name="errors"/>
+
+        <!-- 3. Write rejects to error/error.csv (auto-creates folder) -->
+        <choice doc:name="Any rejects?">
+            <when expression="#[sizeOf(vars.errors default []) > 0]">
+                <file:write config-ref="File_Config" path="#[p('dir.error') ++ '/error.csv']" mode="OVERWRITE" doc:name="Write error.csv">
+                    <file:content><![CDATA[#[output application/csv --- vars.errors]]]></file:content>
+                </file:write>
+            </when>
+        </choice>
+
+        <!-- 4. Split valid leads into chunks of N, write to source folder -->
+        <ee:transform doc:name="Chunk valid leads">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import divideBy from dw::core::Arrays
+output application/java
+---
+(vars.valid default []) divideBy (p('chunk.size') as Number)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="chunkCount" value="#[sizeOf(payload)]" doc:name="chunkCount"/>
+
+        <foreach collection="#[payload]" counterVariableName="idx" doc:name="For each chunk">
+            <file:write config-ref="File_Config"
+                        path="#[p('dir.source') ++ '/chunk-' ++ vars.runId ++ '-' ++ (vars.idx as String) ++ '.csv']"
+                        mode="OVERWRITE" doc:name="Write chunk file">
+                <file:content><![CDATA[#[output application/csv --- payload]]]></file:content>
+            </file:write>
+        </foreach>
+
+        <!-- 5. Summary response -->
+        <ee:transform doc:name="Summary">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    runId: vars.runId,
+    totalExtracted: vars.totalExtracted,
+    validLeads: sizeOf(vars.valid default []),
+    rejected: sizeOf(vars.errors default []),
+    chunkFiles: vars.chunkCount,
+    note: "Valid leads written as chunk files to the source folder; the File Listener will import them."
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <logger level="INFO" message="#['EXTRACT DONE | ' ++ write(payload, 'application/json')]" doc:name="Log summary"/>
+
+        <error-handler>
+            <on-error-propagate doc:name="Extract failed">
+                <logger level="ERROR" message="#['EXTRACT FAILED | runId=' ++ (vars.runId default '?') ++ ' | ' ++ (error.description default '')]"/>
+                <set-payload value='#[output application/json --- { error: (error.description default "extract failed") }]' doc:name="error body"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+</mule>

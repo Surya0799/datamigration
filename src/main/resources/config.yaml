@@ -1,0 +1,46 @@
+# =====================================================================
+# Config for the Marketo bulk export -> dedupe -> chunk -> bulk import POC.
+# Values taken from the Deloitte sandbox Postman collections.
+# (Sandbox creds are inline for demo convenience; encrypt for real envs.)
+# =====================================================================
+
+# --- Local working folders (auto-created on first write) ---
+dir:
+  base:      "/Users/suryanithinpulivarthi/Documents/claudeWorkspace/MarketoBulkMigration/data"
+  extract:   "extract"      # raw export file downloaded from source Marketo
+  source:    "source"       # 10-record chunk files (watched by the File Listener)
+  inprogress: "inprogress"  # chunk moved here while it is being imported (prevents re-pickup)
+  error:     "error"        # error.csv - duplicates, invalid, and import data-failures
+  reprocess: "reprocess"    # reprocess.csv + chunk files that hit connectivity errors
+  processed: "processed"    # chunk files successfully imported (archive)
+  status:    "status"       # status.csv - per-chunk import tracking
+
+chunk:
+  size: "10"                # records per chunk file (quoted: Mule YAML values must be strings)
+
+# --- SOURCE Marketo (Bulk Export) ---
+source:
+  marketo:
+    host:         "733-JCL-696.mktorest.com"
+    clientId:     "25bab723-158f-47a0-89a8-412712052e1c"
+    clientSecret: "9DuC7FJzSoJFHVuzUGCymwt4hIyqGkoA"
+    smartListId:  "1030"
+    fields:       '["firstName","lastName","email","company","country"]'
+
+# --- TARGET Marketo (Bulk Import) ---
+target:
+  marketo:
+    host:         "733-JCL-696.mktorest.com"
+    clientId:     "25bab723-158f-47a0-89a8-412712052e1c"
+    clientSecret: "9DuC7FJzSoJFHVuzUGCymwt4hIyqGkoA"
+    lookupField:  "email"
+    listId:       "10605"
+
+# --- Retry tuning ---
+retry:
+  connect:
+    maxRetries: "3"
+    delayMs:    "5000"
+  poll:
+    maxRetries: "20"
+    delayMs:    "15000"

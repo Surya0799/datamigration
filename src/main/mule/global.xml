@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+
+    <configuration-properties file="config.yaml" doc:name="Properties"/>
+
+    <!-- Manual trigger for the extract/dedupe/chunk flow -->
+    <http:listener-config name="HTTP_Listener" doc:name="HTTP Listener">
+        <http:listener-connection host="0.0.0.0" port="8081"/>
+    </http:listener-config>
+
+    <!-- SOURCE Marketo REST (Bulk Export) -->
+    <http:request-config name="Source_Marketo" doc:name="Source Marketo">
+        <http:request-connection host="${source.marketo.host}" port="443" protocol="HTTPS"/>
+    </http:request-config>
+
+    <!-- TARGET Marketo REST (Bulk Import) -->
+    <http:request-config name="Target_Marketo" doc:name="Target Marketo">
+        <http:request-connection host="${target.marketo.host}" port="443" protocol="HTTPS"/>
+    </http:request-config>
+
+    <!-- Single File config rooted at the data folder; all paths are relative to it.
+         createParentDirectories defaults to true on write, so error/source/etc.
+         folders are created automatically the first time we write into them. -->
+    <file:config name="File_Config" doc:name="Local Files">
+        <file:connection workingDir="${dir.base}"/>
+    </file:config>
+
+</mule>

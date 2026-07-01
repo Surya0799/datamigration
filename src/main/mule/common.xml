@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- OAuth token from SOURCE Marketo -> vars.sourceToken -->
+    <sub-flow name="get-source-token">
+        <http:request method="GET" config-ref="Source_Marketo" path="/identity/oauth/token" doc:name="Source token">
+            <http:query-params><![CDATA[#[{
+                grant_type: "client_credentials",
+                client_id: p('source.marketo.clientId'),
+                client_secret: p('source.marketo.clientSecret')
+            }]]]></http:query-params>
+        </http:request>
+        <set-variable variableName="sourceToken" value="#[payload.access_token]" doc:name="sourceToken"/>
+    </sub-flow>
+
+    <!-- OAuth token from TARGET Marketo -> vars.targetToken -->
+    <sub-flow name="get-target-token">
+        <http:request method="GET" config-ref="Target_Marketo" path="/identity/oauth/token" doc:name="Target token">
+            <http:query-params><![CDATA[#[{
+                grant_type: "client_credentials",
+                client_id: p('target.marketo.clientId'),
+                client_secret: p('target.marketo.clientSecret')
+            }]]]></http:query-params>
+        </http:request>
+        <set-variable variableName="targetToken" value="#[payload.access_token]" doc:name="targetToken"/>
+    </sub-flow>
+
+</mule>
