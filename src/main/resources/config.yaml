@@ -7,7 +7,6 @@
 # --- Local working folders (auto-created on first write) ---
 dir:
   base:      "/Users/suryanithinpulivarthi/Documents/claudeWorkspace/MarketoBulkMigration/data"
-  extract:   "extract"      # raw export file downloaded from source Marketo
   source:    "source"       # 10-record chunk files (watched by the File Listener)
   inprogress: "inprogress"  # chunk moved here while it is being imported (prevents re-pickup)
   error:     "error"        # error.csv - duplicates, invalid, and import data-failures

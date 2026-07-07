@@ -58,48 +58,32 @@
             </choice>
         </until-successful>
 
-        <http:request method="GET" config-ref="Source_Marketo" path="#['/bulk/v1/leads/export/' ++ vars.exportId ++ '/file.json']" doc:name="Download export file">
+        <!-- force the response into concrete bytes so it can be parsed reliably -->
+        <http:request method="GET" config-ref="Source_Marketo" path="#['/bulk/v1/leads/export/' ++ vars.exportId ++ '/file.json']"
+                      outputMimeType="application/octet-stream" doc:name="Download export file">
             <http:headers><![CDATA[#[{ "Authorization": "Bearer " ++ vars.sourceToken }]]]></http:headers>
         </http:request>
-        <!-- archive the raw export (auto-creates the extract folder) -->
-        <file:write config-ref="File_Config" path="#[p('dir.extract') ++ '/export-' ++ vars.runId ++ '.csv']" mode="OVERWRITE" doc:name="Archive raw export">
-            <file:content>#[payload]</file:content>
-        </file:write>
 
-        <!-- 2. Parse + dedupe -->
+        <!-- 2. Parse the export (no dedupe - all extracted records are loaded) -->
         <ee:transform doc:name="Parse export CSV">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
-read((payload default "") as String, "application/csv", {"header": true})]]></ee:set-payload>
+read(payload, "application/csv", {"header": true})]]></ee:set-payload>
             </ee:message>
         </ee:transform>
         <set-variable variableName="totalExtracted" value="#[sizeOf(payload)]" doc:name="totalExtracted"/>
+        <logger level="INFO" message="#['PARSED | totalExtracted=' ++ (sizeOf(payload) as String) ++ ' | first=' ++ (write(payload[0] default {}, 'application/json'))]" doc:name="Log parsed count"/>
 
-        <ee:transform doc:name="Dedupe (split valid / errors)">
-            <ee:message><ee:set-payload resource="dwl/dedupe.dwl"/></ee:message>
-        </ee:transform>
-        <set-variable variableName="valid"  value="#[payload.valid]"  doc:name="valid"/>
-        <set-variable variableName="errors" value="#[payload.errors]" doc:name="errors"/>
-
-        <!-- 3. Write rejects to error/error.csv (auto-creates folder) -->
-        <choice doc:name="Any rejects?">
-            <when expression="#[sizeOf(vars.errors default []) > 0]">
-                <file:write config-ref="File_Config" path="#[p('dir.error') ++ '/error.csv']" mode="OVERWRITE" doc:name="Write error.csv">
-                    <file:content><![CDATA[#[output application/csv --- vars.errors]]]></file:content>
-                </file:write>
-            </when>
-        </choice>
-
-        <!-- 4. Split valid leads into chunks of N, write to source folder -->
-        <ee:transform doc:name="Chunk valid leads">
+        <!-- 3. Split all leads into chunks of N, write to source folder -->
+        <ee:transform doc:name="Chunk leads">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
 import divideBy from dw::core::Arrays
 output application/java
 ---
-(vars.valid default []) divideBy (p('chunk.size') as Number)]]></ee:set-payload>
+(payload default []) divideBy (p('chunk.size') as Number)]]></ee:set-payload>
             </ee:message>
         </ee:transform>
         <set-variable variableName="chunkCount" value="#[sizeOf(payload)]" doc:name="chunkCount"/>
@@ -121,10 +105,8 @@ output application/json
 {
     runId: vars.runId,
     totalExtracted: vars.totalExtracted,
-    validLeads: sizeOf(vars.valid default []),
-    rejected: sizeOf(vars.errors default []),
     chunkFiles: vars.chunkCount,
-    note: "Valid leads written as chunk files to the source folder; the File Listener will import them."
+    note: "All extracted leads written as chunk files to the source folder; the File Listener will import them."
 }]]></ee:set-payload>
             </ee:message>
         </ee:transform>

@@ -77,8 +77,14 @@ output multipart/form-data
                 </http:request>
             </until-successful>
 
-            <!-- call-level rejection (bad request / mapping) counts as a DATA error -->
+            <!-- Classify body-level failures (HTTP 200 but success:false):
+                 transient Marketo codes (606 rate limit, 608 unavailable, 611 system
+                 error, 615 concurrency, 713 transient, 1029 too many jobs) are
+                 retry-able -> reprocess path; everything else is a DATA error. -->
             <choice doc:name="Import accepted?">
+                <when expression="#[payload.success == false and ((payload.errors[0].code default '') matches /606|608|611|615|713|1029/)]">
+                    <raise-error type="APP:TRANSIENT_ERROR" description="#['Marketo transient error, retry later: ' ++ write(payload.errors default [], 'application/json')]"/>
+                </when>
                 <when expression="#[payload.success == false]">
                     <raise-error type="APP:IMPORT_REJECTED" description="#['Marketo rejected import: ' ++ write(payload.errors default [], 'application/json')]"/>
                 </when>
@@ -124,12 +130,12 @@ read((payload default "") as String, "application/csv", {"header": true})
             <file:move config-ref="File_Config" sourcePath="#[vars.chunkPath]"
                        targetPath="#[p('dir.processed') ++ '/' ++ vars.chunkName]" overwrite="true" doc:name="Move to processed"/>
             <flow-ref name="write-status" doc:name="Track status"/>
-            <logger level="INFO" message="#['IMPORT DONE | chunk=' ++ vars.chunkName ++ ' | batchId=' ++ (vars.batchId as String) ++ ' | status=' ++ vars.batchStatus ++ ' | failedRows=' ++ (vars.numFailed as String)]" doc:name="Log done"/>
+            <logger level="INFO" message="#[output text/plain --- 'IMPORT DONE | chunk=' ++ vars.chunkName ++ ' | batchId=' ++ (vars.batchId as String) ++ ' | status=' ++ (vars.batchStatus as String) ++ ' | failedRows=' ++ (vars.numFailed as String)]" doc:name="Log done"/>
 
             <error-handler>
                 <!-- CONNECTIVITY class: retries exhausted -> reprocess later -->
-                <on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT, HTTP:SERVICE_UNAVAILABLE, HTTP:INTERNAL_SERVER_ERROR, MULE:RETRY_EXHAUSTED, MULE:CONNECTIVITY"
-                                   doc:name="Connectivity -> reprocess">
+                <on-error-continue type="APP:TRANSIENT_ERROR, HTTP:CONNECTIVITY, HTTP:TIMEOUT, HTTP:SERVICE_UNAVAILABLE, HTTP:INTERNAL_SERVER_ERROR, MULE:RETRY_EXHAUSTED, MULE:CONNECTIVITY"
+                                   doc:name="Connectivity/transient -> reprocess">
                     <logger level="WARN" message="#['CONNECTIVITY error, sending chunk to reprocess | chunk=' ++ vars.chunkName ++ ' | ' ++ (error.description default '')]"/>
                     <set-variable variableName="batchStatus" value="REPROCESS" doc:name="status=REPROCESS"/>
                     <!-- log the reason in reprocess.csv -->
